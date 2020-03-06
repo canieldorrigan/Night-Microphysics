@@ -1,0 +1,202 @@
+import os
+import numpy as np
+import csv
+import fnmatch
+import click
+import json
+import pprint
+import pickle
+from PIL import Image
+
+
+# create look up tables for each band
+def create_lookup(tir_band, directory = '/Users/home/corrigdani/Documents/Python_Code/Lookup'):
+    lookup = open(directory + '/tir.0' + str(tir_band), 'r')
+    text = lookup.readlines()
+    table = []
+    for line in text:
+        values = line.split()
+        table.append(float(values[1]))
+    return table
+
+
+# create a list of times to use as patterns in the search
+def patgen(initial_time, final_time, step = 15, night_start = 4, night_end = 21): # input times as integers of the form YYYYMMDDHHMM, input the actual final time as final_time, rather than the final+1th time, night start and end is the hour range of darkness
+    month_lengths = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]    # get length of initial month
+    year = initial_time // 10 ** 8
+    if year % 4 == 0 and year % 1000 != 0:   # account for leap years
+        month_lengths[1] = 29
+    month = (initial_time // 10 ** 6) % 100
+    month_length = month_lengths[month - 1]
+    if initial_time % 10 ** 4 < night_start * 100:
+        initial_time += (night_start * 100 - initial_time % 10 ** 4)
+    elif initial_time % 10 ** 4 > night_end * 100:
+        initial_time += (night_end * 100 - initial_time % 10 ** 4)
+    if final_time % 10 ** 4 < night_start * 100:
+        final_time += (night_start * 100 - final_time % 10 ** 4)
+    elif final_time % 10 ** 4 > night_end * 100:
+        final_time += (night_end * 100 - final_time % 10 ** 4)
+    all_times = [initial_time]    # initialise returned list
+    current_time = initial_time
+    while current_time < final_time:
+        if (current_time - (60 - step)) % 100 == 0:  # check for end of hour
+            current_time -= (60 - step)  # reset minutes
+            if (current_time - night_end * 100) % 10 ** 4 == 0:   # check for end of 'night' of current day
+                current_time -= (night_end - night_start) * 100    # reset time to start of 'night'
+                if (current_time - month_length * 10 ** 4 - night_start * 100) % 10 ** 6 == 0:    # check for end of month, update month and month length
+                    current_time -= (month_length - 1) * 10 ** 4    # reset day to 01
+                    month = (month + 1) % 12
+                    month_length = month_lengths[month - 1]
+                    if month == 1:    # check for end of year, update year
+                        year += 1
+                        if year % 4 == 0 and year % 1000 != 0:   # account for leap years
+                            month_lengths[1] = 29
+                        else:
+                            month_lengths[1] = 28
+                        current_time -= 11 * 10 ** 6    # reset month to 01
+                        current_time += 10 ** 8   # increase year by 1
+                    else:
+                        current_time += 10 ** 6   # if year not ending, increase month by 1
+                else:
+                    current_time += 10 ** 4   # if month not ending, increase day by 1
+            else:
+                current_time += 100    # if day not ending, increase hour by 1
+        else:
+            current_time += step
+        all_times.append(current_time)
+    all_time_strings = map(str, all_times)
+    return all_time_strings
+
+
+# create a list of all times when fog was observed at the AWS
+def metar_fog_log(initial = 201507070000, final = 202001010000, aws = 'hna', directory = '/Users/home/corrigdani/Documents/METAR'):
+    fog = open(directory + '/' + aws + '_fg_log.csv', 'r', newline = '')
+    fog_reader = csv.reader(fog)
+    fog_log = []
+    for line in fog_reader:
+        occurrence = int(line[1])
+        if occurrence >= initial and occurrence <= final and occurrence % 10**4 not in [2200, 2300, 0, 100, 200, 300]:
+            fog_log.append(occurrence)
+        elif occurrence > final:
+            break
+    fog_log_strings = map(str, fog_log)
+    return fog_log_strings
+
+
+# convert 2byte greyscale to brightness temperature and reshape into 2D grid for given location
+def grey2temp(geoss, three_band_lookup, location):
+    nanflag = False
+    fid = open(geoss, 'rb')
+    dtype = np.dtype('>u2')
+    bindata = np.fromfile(fid, dtype)
+    #data = bindata.astype(np.float64)
+    if bindata.size == 36000000:
+        bindata = bindata.reshape((6000, 6000))[4700: 5400, 4050: 4700].reshape(700 * 650)
+    data = bindata.astype(np.float64).reshape(700, 650)[location[0]: location[1] + 1, location[2]: location[3] + 1].reshape((location[1] - location[0] + 1) * (location[3] - location[2] + 1))  # snip out desired region and revert back to 1D array
+    lookup_length = len(three_band_lookup[int(geoss[-11])])
+    for i in range(np.size(data)):
+        if data[i] <= lookup_length - 1:
+            data[i] = three_band_lookup[int(geoss[-11])][int(data[i])] # int(geoss[-11]) finds the tir band number in position -11 of the geoss filename, which is used as the 3_band_lookup dictionary key
+        else:
+            data[i] = np.nan
+            nanflag = True
+    #data = data.reshape((700, 650))
+    data = data.reshape((location[1] - location[0] + 1, location[3] - location[2] + 1))
+    return [data, nanflag]
+
+
+# inputs to main method when script is run in terminal (via click module)
+@click.command()
+@click.option('--imagery_directory', '-d', default = '/Users/home/corrigdani/Documents/BIG', help = 'Imagery folder containing all 3 bands in the CEReS .geoss format', show_default = True)
+@click.option('--save_path', '-s', default = '/Users/home/corrigdani/Documents/Default', help = 'Directory where you want to save files', show_default = True)
+@click.option('--initial_time', '-i', default = 201507070000, help = 'Date and time of first image (YYYYMMDDHHMM)', show_default = True)
+@click.option('--final_time', '-f', default = 201912312300, help = 'Date and time of last image (YYYYMMDDHHMM)', show_default = True)
+@click.option('--timestep', '-ts', default = 60, help = 'Time between consecutive images in minutes (timestep must divide 60)', show_default = True)
+@click.option('--aws', '-a', default = 'hna', help = '3 letter automatic weather station code (eg. hna)', show_default = True)
+@click.option('--fog_only', '-fo', default = 0, help = 'Use only the times when fog is detected (0 for all times, 1 for only fog)', show_default = True)
+@click.option('--colour', '-c', default = 'rgb', help = 'Create the full rgb image or just a single band (r-red, g-green, b-blue, rgb-all', show_default = True)
+@click.option('--recipe', '-r', default = 1, help = 'Use the EUMETSAT or JMA recipe (0 for EUMETSAT, 1 for JMA)', show_default = True)
+@click.option('--boundary', '-b', default = '000699000649', help = '3-digit row/column indices of boundaries of snipped image written as a single string (order: rowmin, rowmax+1, colmin, colmax+1)', show_default = True)
+
+
+# main method that for each hour finds the .geoss for each band then has options to create an image and to save the RGB brightness temperature triple for the desired pixel (HNA) to an array
+def main(imagery_directory, save_path, initial_time, final_time, timestep, aws, fog_only, colour, recipe, boundary):
+    missing = []
+    bad_pixel_dict = {}
+    aws_triples = {}
+    location = [int(boundary[0: 3]), int(boundary[3: 6]), int(boundary[6: 9]), int(boundary[9: 12])]
+    lookup3 = {tir: create_lookup(tir) for tir in [1, 3, 5]}   # create a dictionary containing tir01 lookup table under the key 1, tir 03 under the key 3, etc
+    if recipe == 1:
+        thresholds = [-6.7, 2.6, -3.1, 5.2, 243.6, 292.6]   # choose gradation adjustment thresholds according to recipe
+    else:
+        thresholds = [-4, 2, 0, 10, 243, 293]
+    if fog_only == 1:
+        hours = metar_fog_log(initial_time, final_time, aws)
+    else:
+        hours = patgen(initial_time, final_time, timestep)    # create a list of times to use as patterns in the search
+    for pattern in hours:
+        nanflag = False
+        empty = False
+        #three_band = np.zeros((700, 650 , 3), 'float64')
+        three_band = np.zeros((location[1] - location[0] + 1, location[3] - location[2] + 1, 3), 'float64')
+        print(pattern)
+        found = 0   # reset number of found pattern matches to zero
+        for subdir, dirs, files in os.walk(imagery_directory):    # search the directory for pattern
+            for name in files:
+                if fnmatch.fnmatch(name, pattern + '*.geoss'):    # given a match, convert to brightness temperature and store in three_band
+                    geoss_file = os.path.join(subdir, name)
+                    if os.path.getsize(geoss_file) < 910000:    # check missing data (empty/smaller than 910kB geoss files)
+                        empty = True
+                    else:
+                        [temps, current_nanflag] = grey2temp(geoss_file, lookup3, location)
+                        nanflag = nanflag or current_nanflag
+                        three_band[..., (int(geoss_file[-11]) - 1) // 2] = temps  # band ordering is tir01, tir03, tir05 or 13, 15, 7
+                    found += 1
+                    if found == 3:  # stop search when all data for the current time is found
+                        break
+            else:
+                continue
+            break
+        pattern = int(pattern)
+        if found < 3 or empty:
+            missing.append(pattern)
+        else:
+            differences = np.zeros((location[1] - location[0] + 1, location[3] - location[2] + 1, 3), 'float64')   # do the band differencing and clipping/gradation adjustment
+            differences[..., 0] = np.clip((three_band[..., 1] - three_band[..., 0]), thresholds[0], thresholds[1])   # Red
+            differences[..., 1] = np.clip((three_band[..., 0] - three_band[..., 2]), thresholds[2], thresholds[3])   # Green
+            differences[..., 2] = np.clip(three_band[..., 0], thresholds[4], thresholds[5])   # Blue
+            rgb = np.zeros((location[1] - location[0] + 1, location[3] - location[2] + 1, 3), 'uint8')
+            for sheet in range(3):
+                rgb[..., sheet] = np.uint8(255 * ((differences[..., sheet] - thresholds[2 * sheet]) / (thresholds[2 * sheet + 1] - thresholds[2 * sheet])))     # rescale to 8-bit colour 
+            if nanflag == True:
+                bad_pixels = np.argwhere(np.isnan(np.sum(rgb, axis = 2)))   # store locations of bad pixels in dictionary where key is the date/time of the image
+                bad_pixel_dict[pattern] = bad_pixels
+            rgb[..., 0][np.isnan(rgb[..., 0])] = 255    # display bad pixels as bright orange
+            rgb[..., 1][np.isnan(rgb[..., 1])] = 153
+            rgb[..., 2][np.isnan(rgb[..., 2])] = 51
+            #aws_triples[pattern] = [list(rgb[192, 466, :]), list(differences[192, 466, :])]   # store [[r, g, b], [rtemp, gtemp, btemp]] in dictionary where key is the date/time of the image (HNA is within the pixel at index [192, 466])
+            aws_triples[pattern] = [list(rgb[50, 50, :]), list(differences[50, 50, :])]
+            if colour == 'rgb':    # save image as png for the desired colour scheme
+                img = Image.fromarray(rgb, 'RGB')
+            else:
+                colour_choice = {'r': 0, 'g': 1, 'b': 2}
+                band_palette = []
+                triple = [0, 0, 0]
+                for i in range(256):
+                    triple[colour_choice[colour]] = i
+                    band_palette += triple
+                img = Image.fromarray(rgb[..., colour_choice[colour]], 'P')
+                img.putpalette(band_palette)
+            img.save(save_path + '/' + colour + str(pattern) + '.png')
+    with open(save_path + '/' + 'aws_triples_' + str(initial_time) + '-' + str(final_time) + '.pickle', 'wb') as filename0:    # save 'bad' and 'missing' dictionaries with Pickle        
+        pickle.dump(aws_triples, filename0)
+    with open(save_path + '/' + 'bad_' + str(initial_time) + '-' + str(final_time) + '.pickle', 'wb') as filename1:    # save 'bad' and 'missing' dictionaries with Pickle        
+        pickle.dump(bad_pixel_dict, filename1)
+    with open(save_path + '/' + 'missing_' + str(initial_time) + '-' + str(final_time) + '.pickle', 'wb') as filename2:    # save 'bad' and 'missing' dictionaries with Pickle        
+        pickle.dump(missing, filename2)
+    print(json.dumps(missing))
+    pprint.pprint(bad_pixel_dict)
+    pprint.pprint(aws_triples)
+
+if __name__ == '__main__':
+    main()
